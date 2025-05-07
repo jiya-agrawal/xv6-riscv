@@ -91,3 +91,31 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+
+//additions
+uint64
+sys_clone(void)
+{
+  uint64 fcn, arg1, arg2, stack;
+  
+  // argaddr is void, so we can't check its return value
+  // directly call it instead
+  argaddr(0, &fcn);
+  argaddr(1, &arg1);
+  argaddr(2, &arg2);
+  argaddr(3, &stack);
+
+  return clone((void (*)(void *, void *))fcn, (void *)arg1, (void *)arg2, (void *)stack);
+}
+
+uint64
+sys_join(void)
+{
+  uint64 stack_addr;
+  
+  // argaddr is void, so we can't check its return value
+  argaddr(0, &stack_addr);
+
+  return join((void **)stack_addr);
+}

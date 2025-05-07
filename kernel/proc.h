@@ -104,4 +104,8 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  
+  // additions
+  void *threadstack;           // Address of thread stack to be freed
+  char shared_addr_space;    // 1 if shares address space with parent
 };

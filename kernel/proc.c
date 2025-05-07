@@ -10,6 +10,18 @@ struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
 
+// additions
+struct {
+  struct spinlock lock;
+  struct proc proc[NPROC];
+} ptable;
+
+void
+pinit(void)
+{
+  initlock(&ptable.lock, "ptable");
+}
+
 struct proc *initproc;
 
 int nextpid = 1;
@@ -302,6 +314,10 @@ fork(void)
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
 
+  // additions
+  // Set shared_addr_space to 0 (false) for processes
+  np->shared_addr_space = 0;
+
   // increment reference counts on open file descriptors.
   for(i = 0; i < NOFILE; i++)
     if(p->ofile[i])
@@ -340,6 +356,137 @@ reparent(struct proc *p)
   }
 }
 
+
+//additions
+
+int 
+clone(void(*fcn)(void*, void*), void *arg1, void *arg2, void* stack)
+{
+  int i, pid;
+  struct proc *np;
+  struct proc *p = myproc();
+
+  // Check if stack is page-aligned
+  if((uint64)stack % PGSIZE != 0)
+    return -1;
+
+  // Allocate process.
+  if((np = allocproc()) == 0){
+    return -1;
+  }
+
+  // Share address space with parent instead of copying
+  np->pagetable = p->pagetable;
+  np->sz = p->sz;
+
+  // Copy saved user registers.
+  *(np->trapframe) = *(p->trapframe);
+
+  // Save thread stack information
+  np->threadstack = stack;
+  np->shared_addr_space = 1;  // Mark as a thread (sharing address space)
+
+  // Setup thread's stack
+  // Calculate positions on the stack for args and return PC
+  uint64 sp = (uint64)stack + PGSIZE;
+
+  // Reserve space for return PC and two arguments (3 words)
+  sp -= 3 * sizeof(uint64);
+
+  // Put fake return PC at the bottom of stack
+  uint64 ustack[3];
+  ustack[0] = 0xFFFFFFFF;  // Fake return PC
+  ustack[1] = (uint64)arg1;
+  ustack[2] = (uint64)arg2;
+
+  // Copy the stack data
+  if(copyout(p->pagetable, sp, (char *)ustack, sizeof(ustack)) < 0) {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+
+  // Set stack pointer and instruction pointer for the new thread
+  np->trapframe->sp = sp;
+  np->trapframe->epc = (uint64)fcn;  // Set entry point
+
+  // Return 0 to the child thread
+  np->trapframe->a0 = 0;
+
+  // Increment reference counts on open file descriptors.
+  for(i = 0; i < NOFILE; i++)
+    if(p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
+  np->cwd = idup(p->cwd);
+
+  safestrcpy(np->name, p->name, sizeof(p->name));
+
+  pid = np->pid;
+
+  // Set thread state to RUNNABLE only after initialization is complete
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+
+  return pid;
+}
+
+int
+join(void **stack)
+{
+  struct proc *np;
+  int havekids, pid;
+  struct proc *p = myproc();
+  
+  acquire(&wait_lock);
+  
+  for(;;){
+    // Scan through table looking for exited children that share address space.
+    havekids = 0;
+    for(np = proc; np < &proc[NPROC]; np++){
+      if(np->parent == p && np->shared_addr_space == 1){
+        // Found a child thread
+        acquire(&np->lock);
+        havekids = 1;
+        
+        if(np->state == ZOMBIE){
+          // Found one.
+          pid = np->pid;
+          
+          // Copy thread stack pointer to parent
+          if(stack != 0 && copyout(p->pagetable, (uint64)stack, 
+                                (char*)&np->threadstack, 
+                                sizeof(np->threadstack)) < 0) {
+            release(&np->lock);
+            release(&wait_lock);
+            return -1;
+          }
+          
+          // Free thread resources
+          freeproc(np);
+          
+          release(&np->lock);
+          release(&wait_lock);
+          return pid;
+        }
+        release(&np->lock);
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!havekids || p->killed){
+      release(&wait_lock);
+      return -1;
+    }
+    
+    // Wait for children to exit.
+    sleep(p, &wait_lock);  // DOC: wait-sleep
+  }
+}
+
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
 // until its parent calls wait().
@@ -370,144 +517,23 @@ exit(int status)
   // Give any children to init.
   reparent(p);
 
-  // Parent might be sleeping in wait().
-  wakeup(p->parent);
-  
-  acquire(&p->lock);
+  if (p->shared_addr_space) {
+    wakeup(p);
+    p->state = ZOMBIE;
+    release(&wait_lock);
+    acquire(&p->lock);
+  } else {
+    wakeup(p->parent);
+    acquire(&p->lock);
+    p->xstate = status;
+    p->state = ZOMBIE;
+    release(&wait_lock);
+  }
 
-  p->xstate = status;
-  p->state = ZOMBIE;
-
-  release(&wait_lock);
-
-  // Jump into the scheduler, never to return.
   sched();
   panic("zombie exit");
 }
 
-// Wait for a child process to exit and return its pid.
-// Return -1 if this process has no children.
-int
-wait(uint64 addr)
-{
-  struct proc *pp;
-  int havekids, pid;
-  struct proc *p = myproc();
-
-  acquire(&wait_lock);
-
-  for(;;){
-    // Scan through table looking for exited children.
-    havekids = 0;
-    for(pp = proc; pp < &proc[NPROC]; pp++){
-      if(pp->parent == p){
-        // make sure the child isn't still in exit() or swtch().
-        acquire(&pp->lock);
-
-        havekids = 1;
-        if(pp->state == ZOMBIE){
-          // Found one.
-          pid = pp->pid;
-          if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
-                                  sizeof(pp->xstate)) < 0) {
-            release(&pp->lock);
-            release(&wait_lock);
-            return -1;
-          }
-          freeproc(pp);
-          release(&pp->lock);
-          release(&wait_lock);
-          return pid;
-        }
-        release(&pp->lock);
-      }
-    }
-
-    // No point waiting if we don't have any children.
-    if(!havekids || killed(p)){
-      release(&wait_lock);
-      return -1;
-    }
-    
-    // Wait for a child to exit.
-    sleep(p, &wait_lock);  //DOC: wait-sleep
-  }
-}
-
-// Per-CPU process scheduler.
-// Each CPU calls scheduler() after setting itself up.
-// Scheduler never returns.  It loops, doing:
-//  - choose a process to run.
-//  - swtch to start running that process.
-//  - eventually that process transfers control
-//    via swtch back to the scheduler.
-void
-scheduler(void)
-{
-  struct proc *p;
-  struct cpu *c = mycpu();
-
-  c->proc = 0;
-  for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting.
-    intr_on();
-
-    int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
-      }
-      release(&p->lock);
-    }
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
-      intr_on();
-      asm volatile("wfi");
-    }
-  }
-}
-
-// Switch to scheduler.  Must hold only p->lock
-// and have changed proc->state. Saves and restores
-// intena because intena is a property of this
-// kernel thread, not this CPU. It should
-// be proc->intena and proc->noff, but that would
-// break in the few places where a lock is held but
-// there's no process.
-void
-sched(void)
-{
-  int intena;
-  struct proc *p = myproc();
-
-  if(!holding(&p->lock))
-    panic("sched p->lock");
-  if(mycpu()->noff != 1)
-    panic("sched locks");
-  if(p->state == RUNNING)
-    panic("sched running");
-  if(intr_get())
-    panic("sched interruptible");
-
-  intena = mycpu()->intena;
-  swtch(&p->context, &mycpu()->context);
-  mycpu()->intena = intena;
-}
-
-// Give up the CPU for one scheduling round.
 void
 yield(void)
 {
@@ -548,27 +574,17 @@ void
 sleep(void *chan, struct spinlock *lk)
 {
   struct proc *p = myproc();
-  
-  // Must acquire p->lock in order to
-  // change p->state and then call sched.
-  // Once we hold p->lock, we can be
-  // guaranteed that we won't miss any wakeup
-  // (wakeup locks p->lock),
-  // so it's okay to release lk.
 
-  acquire(&p->lock);  //DOC: sleeplock1
+  acquire(&p->lock);
   release(lk);
 
-  // Go to sleep.
   p->chan = chan;
   p->state = SLEEPING;
 
   sched();
 
-  // Tidy up.
   p->chan = 0;
 
-  // Reacquire original lock.
   release(&p->lock);
   acquire(lk);
 }
@@ -691,5 +707,99 @@ procdump(void)
       state = "???";
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
+  }
+}
+
+void scheduler(void) {
+  struct proc *p;
+  struct cpu *c = mycpu();
+
+  c->proc = 0;
+  for (;;) {
+    // Enable interrupts on this processor.
+    intr_on();
+
+    // Loop over process table looking for process to run.
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE) {
+        // Switch to chosen process. It is the process's job
+        // to release its lock and then reacquire it
+        // before jumping back to us.
+        p->state = RUNNING;
+        c->proc = p;
+        swtch(&c->context, &p->context);
+
+        // Process is done running for now.
+        // It should have changed its p->state before coming back.
+        c->proc = 0;
+      }
+      release(&p->lock);
+    }
+  }
+}
+
+void sched(void) {
+  int intena;
+  struct proc *p = myproc();
+
+  if (!holding(&p->lock))
+    panic("sched p->lock");
+  if (mycpu()->noff != 1)
+    panic("sched locks");
+  if (p->state == RUNNING)
+    panic("sched running");
+  if (intr_get())
+    panic("sched interruptible");
+
+  intena = mycpu()->intena;
+  swtch(&p->context, &mycpu()->context);
+  mycpu()->intena = intena;
+}
+
+int
+wait(uint64 addr)
+{
+  struct proc *pp;
+  int havekids, pid;
+  struct proc *p = myproc();
+
+  acquire(&wait_lock);
+
+  for(;;){
+    // Scan through table looking for exited children.
+    havekids = 0;
+    for(pp = proc; pp < &proc[NPROC]; pp++){
+      if(pp->parent == p){
+        // Make sure the child isn't still in exit() or swtch().
+        acquire(&pp->lock);
+
+        havekids = 1;
+        if(pp->state == ZOMBIE){
+          // Found one.
+          pid = pp->pid;
+          if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
+                                  sizeof(pp->xstate)) < 0) {
+            release(&pp->lock);
+            release(&wait_lock);
+            return -1;
+          }
+          freeproc(pp);
+          release(&pp->lock);
+          release(&wait_lock);
+          return pid;
+        }
+        release(&pp->lock);
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!havekids || killed(p)){
+      release(&wait_lock);
+      return -1;
+    }
+
+    // Wait for a child to exit.
+    sleep(p, &wait_lock);  // DOC: wait-sleep
   }
 }

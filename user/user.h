@@ -1,4 +1,13 @@
+#ifndef USER_H
+#define USER_H
+
 struct stat;
+
+// Define the lock structure
+typedef struct __lock_t {
+    uint ticket;
+    uint turn;
+} lock_t;
 
 // system calls
 int fork(void);
@@ -22,6 +31,10 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+//additions
+int clone(void (*start_routine)(void*,void*), void *, void *, void *);
+int join(void**);
+
 
 // ulib.c
 int stat(const char*, struct stat*);
@@ -41,3 +54,12 @@ void *memcpy(void *, const void *, uint);
 // umalloc.c
 void* malloc(uint);
 void free(void*);
+
+// //additions
+int thread_create(void (*start_routine)(void *,void*), void * arg1, void * arg2);
+int thread_join(); 
+int lock_init(lock_t *lk);
+void lock_acquire(lock_t *lk);
+void lock_release(lock_t *lk);
+
+#endif // USER_H
